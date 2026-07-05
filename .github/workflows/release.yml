@@ -1,0 +1,162 @@
+# ============================================================
+#  OpenEVSE Firmware Flasher - Automated Build & Release
+#
+#  Triggers on any tag starting with "v" (e.g. v1.0.0)
+#  Builds for Windows, macOS, and Linux in parallel.
+#  Uploads all three zips as assets on the GitHub Release.
+#
+#  Usage:
+#    git tag v1.0.0
+#    git push origin v1.0.0
+# ============================================================
+
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # required to create/update releases
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+
+          # ── Windows ────────────────────────────────────────
+          - os: windows-latest
+            platform: windows
+            exe: dist/OpenEVSE_Flasher.exe
+            zip: OpenEVSE_Flasher-windows.zip
+
+          # ── macOS ──────────────────────────────────────────
+          - os: macos-latest
+            platform: macos
+            exe: dist/OpenEVSE_Flasher
+            zip: OpenEVSE_Flasher-macos.zip
+
+          # ── Linux ──────────────────────────────────────────
+          - os: ubuntu-latest
+            platform: linux
+            exe: dist/OpenEVSE_Flasher
+            zip: OpenEVSE_Flasher-linux.zip
+
+    steps:
+      # ── Source ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python ─────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── PyInstaller ────────────────────────────────────────
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller openevse_flasher.spec
+
+      # ── avrdude – Windows ──────────────────────────────────
+      - name: Get avrdude (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod "https://api.github.com/repos/avrdude/avrdude/releases/latest"
+          $asset = $rel.assets | Where-Object { $_.name -match "windows_x86.*\.zip" } | Select-Object -First 1
+          if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -match "windows.*\.zip" } | Select-Object -First 1 }
+          Write-Host "Downloading $($asset.browser_download_url)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile avrdude_win.zip
+          Expand-Archive avrdude_win.zip -DestinationPath avrdude_tmp
+          New-Item -ItemType Directory -Force -Path avrdude | Out-Null
+          $exePath = Get-ChildItem -Path avrdude_tmp -Filter avrdude.exe -Recurse | Select-Object -First 1
+          Copy-Item $exePath.FullName avrdude\avrdude.exe
+          $confPath = Get-ChildItem -Path avrdude_tmp -Filter avrdude.conf -Recurse | Select-Object -First 1
+          if ($confPath) { Copy-Item $confPath.FullName avrdude\avrdude.conf }
+          Write-Host "avrdude version:" (& avrdude\avrdude.exe -v 2>&1 | Select-String "avrdude")
+
+      # ── avrdude – macOS ────────────────────────────────────
+      - name: Get avrdude (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install avrdude
+          mkdir -p avrdude
+          cp "$(which avrdude)" avrdude/avrdude
+          avrdude/avrdude -v 2>&1 | head -2
+
+      # ── avrdude – Linux ────────────────────────────────────
+      - name: Get avrdude (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y avrdude
+          mkdir -p avrdude
+          cp "$(which avrdude)" avrdude/avrdude
+          avrdude/avrdude -v 2>&1 | head -2
+
+      # ── Package – Windows ──────────────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release\avrdude | Out-Null
+          New-Item -ItemType Directory -Force -Path release\drivers | Out-Null
+          Copy-Item dist\OpenEVSE_Flasher.exe release\
+          if (Test-Path avrdude\avrdude.exe) { Copy-Item avrdude\avrdude.exe release\avrdude\ }
+          if (Test-Path avrdude\avrdude.conf) { Copy-Item avrdude\avrdude.conf release\avrdude\ }
+          if (Test-Path drivers\zadig.ini)    { Copy-Item drivers\zadig.ini    release\drivers\ }
+          if (Test-Path drivers\usbasp.cfg)   { Copy-Item drivers\usbasp.cfg   release\drivers\ }
+          if (Test-Path eeprom_24.bin)        { Copy-Item eeprom_24.bin        release\ }
+          if (Test-Path README.md)            { Copy-Item README.md            release\ }
+          Compress-Archive -Path release\* -DestinationPath ${{ matrix.zip }} -Force
+
+      # ── Package – macOS / Linux ────────────────────────────
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release/avrdude release/drivers
+          cp ${{ matrix.exe }} release/OpenEVSE_Flasher
+          chmod +x release/OpenEVSE_Flasher
+          [ -f avrdude/avrdude    ] && cp avrdude/avrdude    release/avrdude/ && chmod +x release/avrdude/avrdude
+          [ -f drivers/zadig.ini  ] && cp drivers/zadig.ini  release/drivers/
+          [ -f drivers/usbasp.cfg ] && cp drivers/usbasp.cfg release/drivers/
+          [ -f eeprom_24.bin      ] && cp eeprom_24.bin      release/
+          [ -f README.md          ] && cp README.md          release/
+          cd release && zip -r ../${{ matrix.zip }} . && cd ..
+
+      # ── Upload artifact (for release job) ──────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip }}
+          path: ${{ matrix.zip }}
+
+  # ──────────────────────────────────────────────────────────
+  # Publish all three zips to a single GitHub Release
+  # ──────────────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.zip'
+          generate_release_notes: true
+          fail_on_unmatched_files: true
