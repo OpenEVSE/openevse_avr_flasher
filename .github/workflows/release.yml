@@ -107,15 +107,23 @@ jobs:
         run: |
           APP="dist/OpenEVSE Flasher.app"
           # Prove the bundled avrdude works without Homebrew's copy
-          brew uninstall --ignore-dependencies avrdude libusb libusb-compat hidapi libftdi libelf || true
+          # (uninstall leaves etc/avrdude.conf behind, so remove that too)
+          BREW_PREFIX=$(brew --prefix)
+          brew uninstall --ignore-dependencies avrdude libusb libusb-compat hidapi libftdi || true
+          rm -f "$BREW_PREFIX/etc/avrdude.conf"
           AVRDUDE=$(find "$APP" -type f -name avrdude | head -1)
-          CONF=$(find "$APP" -name avrdude.conf | head -1)
+          CONF="$(dirname "$AVRDUDE")/avrdude.conf"   # where the app looks
+          test -n "$AVRDUDE" && test -f "$CONF"
           python scripts/smoke_test.py avrdude "$AVRDUDE" "$CONF"
           python scripts/smoke_test.py app "$APP/Contents/MacOS/OpenEVSE_Flasher"
 
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
-        run: xvfb-run -a python scripts/smoke_test.py app dist/OpenEVSE_Flasher
+        run: |
+          # Run without the system avrdude, its libraries or its config
+          sudo apt-get remove -y avrdude libftdi1 libusb-0.1-4 libhidapi-libusb0 || true
+          sudo rm -f /etc/avrdude.conf
+          xvfb-run -a python scripts/smoke_test.py app dist/OpenEVSE_Flasher
 
       # ── Package ────────────────────────────────────────────
       - name: Package (Windows)

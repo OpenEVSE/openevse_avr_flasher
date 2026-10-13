@@ -44,23 +44,26 @@ def find_avrdude():
     if not exe:
         sys.exit('ERROR: avrdude not found -- install it (brew / apt) '
                  'or place it in avrdude/')
-    exe = os.path.realpath(exe)
-    # Same conf the system avrdude uses: <prefix>/etc/avrdude.conf
-    prefix = os.path.dirname(os.path.dirname(exe))
-    for conf in (os.path.join(prefix, 'etc', 'avrdude.conf'),
-                 '/etc/avrdude.conf'):
+    real = os.path.realpath(exe)
+    # Same conf the system avrdude uses: <prefix>/etc/avrdude.conf. Check the
+    # PATH prefix before the resolved one: Homebrew keeps the conf in
+    # $(brew --prefix)/etc, not in the Cellar the binary resolves to.
+    prefixes = [os.path.dirname(os.path.dirname(p)) for p in (exe, real)]
+    for conf in [os.path.join(p, 'etc', 'avrdude.conf') for p in prefixes] + \
+                ['/opt/homebrew/etc/avrdude.conf', '/usr/local/etc/avrdude.conf',
+                 '/etc/avrdude.conf']:
         if os.path.isfile(conf):
-            return exe, conf
-    return exe, None
+            return real, conf
+    return real, None
 
 
 avrdude_exe, avrdude_conf = find_avrdude()
 print('Bundling avrdude: %s (conf: %s)' % (avrdude_exe, avrdude_conf))
 binaries.append((avrdude_exe, 'avrdude'))
-if avrdude_conf:
-    datas.append((avrdude_conf, 'avrdude'))
-else:
-    print('WARNING: avrdude.conf not found -- avrdude may not start')
+if not avrdude_conf:
+    sys.exit('ERROR: avrdude.conf not found -- the bundled avrdude '
+             'would not start on other machines')
+datas.append((avrdude_conf, 'avrdude'))
 
 if WINDOWS:
     for f in ('zadig-2.9.exe', 'zadig.ini', 'usbasp.cfg'):
