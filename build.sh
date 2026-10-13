@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
 #  OpenEVSE Firmware Flasher - macOS / Linux Build Script
-#  Produces:  OpenEVSE_Flasher-<platform>.zip
-#  Requires:  Python 3.7+, pip
+#  Produces a standalone program (no Python needed to run it):
+#    macOS:  OpenEVSE_Flasher-macos.zip   (OpenEVSE Flasher.app)
+#    Linux:  OpenEVSE_Flasher-linux.tar.gz
+#  Requires:  Python 3.8+ with tkinter, pip, and avrdude
+#             (brew install avrdude / sudo apt install avrdude)
+#  avrdude and its libraries are packed inside the program.
 # ============================================================
 set -e
 
@@ -31,6 +35,15 @@ for candidate in python3 python; do
 done
 [ -z "$PYTHON" ] && { echo " ERROR: Python 3 not found."; exit 1; }
 echo " Using $($PYTHON --version)"
+"$PYTHON" -c "import tkinter" 2>/dev/null || {
+    echo " ERROR: tkinter missing (Debian/Ubuntu: sudo apt install python3-tk)"; exit 1; }
+
+if [ ! -f avrdude/avrdude ] && ! command -v avrdude &>/dev/null; then
+    echo " ERROR: avrdude not found."
+    echo "   macOS:  brew install avrdude"
+    echo "   Linux:  sudo apt install avrdude"
+    exit 1
+fi
 
 # ── Install / upgrade PyInstaller ────────────────────────────
 echo ""
@@ -38,48 +51,27 @@ echo " Installing PyInstaller..."
 "$PYTHON" -m pip install --upgrade pyinstaller --quiet
 
 # ── Clean previous build ─────────────────────────────────────
-rm -rf dist build release
+rm -rf dist build
 
 # ── Build executable ─────────────────────────────────────────
 echo ""
 echo " Building executable..."
-"$PYTHON" -m PyInstaller openevse_flasher.spec
+"$PYTHON" -m PyInstaller --noconfirm openevse_flasher.spec
 
-# ── Assemble release folder ──────────────────────────────────
+# ── Package ──────────────────────────────────────────────────
 echo ""
-echo " Assembling release folder..."
-mkdir -p release/avrdude release/drivers
-
-cp dist/OpenEVSE_Flasher release/
-chmod +x release/OpenEVSE_Flasher
-
-if [ -f "avrdude/avrdude" ]; then
-    cp avrdude/avrdude release/avrdude/
-    chmod +x release/avrdude/avrdude
-    echo " Bundled avrdude from local avrdude/ folder."
+if [ "$PLATFORM" = "macos" ]; then
+    OUT="OpenEVSE_Flasher-macos.zip"
+    rm -f "$OUT"
+    ditto -c -k --keepParent "dist/OpenEVSE Flasher.app" "$OUT"
 else
-    # Try system avrdude as fallback
-    AVRDUDE_BIN=$(command -v avrdude 2>/dev/null || true)
-    if [ -n "$AVRDUDE_BIN" ]; then
-        cp "$AVRDUDE_BIN" release/avrdude/avrdude
-        chmod +x release/avrdude/avrdude
-        echo " Bundled system avrdude from $AVRDUDE_BIN"
-    else
-        echo " NOTE: avrdude not found -- add it to avrdude/ before distributing."
-    fi
+    OUT="OpenEVSE_Flasher-linux.tar.gz"
+    rm -rf pkg && mkdir -p pkg/OpenEVSE_Flasher
+    cp dist/OpenEVSE_Flasher pkg/OpenEVSE_Flasher/
+    chmod +x pkg/OpenEVSE_Flasher/OpenEVSE_Flasher
+    tar -czf "$OUT" -C pkg OpenEVSE_Flasher
+    rm -rf pkg
 fi
 
-[ -f drivers/zadig.ini  ] && cp drivers/zadig.ini  release/drivers/
-[ -f drivers/usbasp.cfg ] && cp drivers/usbasp.cfg release/drivers/
-[ -f eeprom_24.bin      ] && cp eeprom_24.bin       release/
-[ -f README.md          ] && cp README.md            release/
-
-# ── Zip release ──────────────────────────────────────────────
-ZIP_NAME="OpenEVSE_Flasher-${PLATFORM}.zip"
-echo ""
-echo " Creating ${ZIP_NAME}..."
-cd release && zip -r "../${ZIP_NAME}" . && cd ..
-
-echo ""
-echo " Done!  Output: ${ZIP_NAME}"
+echo " Done!  Output: $OUT"
 echo ""

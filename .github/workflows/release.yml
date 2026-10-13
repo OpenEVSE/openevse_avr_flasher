@@ -1,151 +1,155 @@
 # ============================================================
 #  OpenEVSE Firmware Flasher - Automated Build & Release
 #
-#  Triggers on any tag starting with "v" (e.g. v1.0.0)
-#  Builds for Windows, macOS, and Linux in parallel.
-#  Uploads all three zips as assets on the GitHub Release.
+#  Builds a standalone program (no Python needed) for Windows,
+#  macOS (Apple Silicon + Intel) and Linux, smoke-tests each one,
+#  and attaches them to a GitHub Release.
 #
-#  Usage:
-#    git tag v1.0.0
-#    git push origin v1.0.0
+#  New release:
+#    git tag v1.1.0
+#    git push origin v1.1.0
+#
+#  Add / refresh the downloads on an existing release:
+#    Actions -> Build & Release -> Run workflow -> tag: v1.0.0
+#
+#  Pushes to main and pull requests build and test only.
 # ============================================================
 
 name: Build & Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the downloads to (blank = build only)'
+        required: false
+        default: ''
 
 permissions:
   contents: write   # required to create/update releases
 
+env:
+  RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
+          - name: Windows
+            os: windows-latest
+            asset: OpenEVSE_Flasher-windows.exe
 
-          # ── Windows ────────────────────────────────────────
-          - os: windows-latest
-            platform: windows
-            exe: dist/OpenEVSE_Flasher.exe
-            zip: OpenEVSE_Flasher-windows.zip
+          - name: macOS Apple Silicon
+            os: macos-latest
+            asset: OpenEVSE_Flasher-macos-apple-silicon.zip
 
-          # ── macOS ──────────────────────────────────────────
-          - os: macos-latest
-            platform: macos
-            exe: dist/OpenEVSE_Flasher
-            zip: OpenEVSE_Flasher-macos.zip
+          - name: macOS Intel
+            os: macos-15-intel
+            asset: OpenEVSE_Flasher-macos-intel.zip
 
-          # ── Linux ──────────────────────────────────────────
-          - os: ubuntu-latest
-            platform: linux
-            exe: dist/OpenEVSE_Flasher
-            zip: OpenEVSE_Flasher-linux.zip
+          # Oldest supported runner = widest glibc compatibility
+          - name: Linux
+            os: ubuntu-22.04
+            asset: OpenEVSE_Flasher-linux-x86_64.tar.gz
 
     steps:
-      # ── Source ─────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Python ─────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # ── PyInstaller ────────────────────────────────────────
       - name: Install PyInstaller
-        run: pip install pyinstaller
-
-      - name: Build executable
-        run: pyinstaller openevse_flasher.spec
-
-      # ── avrdude – Windows ──────────────────────────────────
-      - name: Get avrdude (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
         run: |
-          $rel = Invoke-RestMethod "https://api.github.com/repos/avrdude/avrdude/releases/latest"
-          $asset = $rel.assets | Where-Object { $_.name -match "windows_x86.*\.zip" } | Select-Object -First 1
-          if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -match "windows.*\.zip" } | Select-Object -First 1 }
-          Write-Host "Downloading $($asset.browser_download_url)"
-          Invoke-WebRequest $asset.browser_download_url -OutFile avrdude_win.zip
-          Expand-Archive avrdude_win.zip -DestinationPath avrdude_tmp
-          New-Item -ItemType Directory -Force -Path avrdude | Out-Null
-          $exePath = Get-ChildItem -Path avrdude_tmp -Filter avrdude.exe -Recurse | Select-Object -First 1
-          Copy-Item $exePath.FullName avrdude\avrdude.exe
-          $confPath = Get-ChildItem -Path avrdude_tmp -Filter avrdude.conf -Recurse | Select-Object -First 1
-          if ($confPath) { Copy-Item $confPath.FullName avrdude\avrdude.conf }
-          Write-Host "avrdude version:" (& avrdude\avrdude.exe -v 2>&1 | Select-String "avrdude")
+          pip install pyinstaller
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
 
-      # ── avrdude – macOS ────────────────────────────────────
-      - name: Get avrdude (macOS)
+      # Windows uses avrdude/avrdude.exe from the repo. macOS / Linux bundle
+      # the system avrdude; PyInstaller packs its shared libraries with it.
+      - name: Install avrdude (macOS)
         if: runner.os == 'macOS'
-        run: |
-          brew install avrdude
-          mkdir -p avrdude
-          cp "$(which avrdude)" avrdude/avrdude
-          avrdude/avrdude -v 2>&1 | head -2
+        run: brew install avrdude
 
-      # ── avrdude – Linux ────────────────────────────────────
-      - name: Get avrdude (Linux)
+      - name: Install avrdude (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y avrdude
-          mkdir -p avrdude
-          cp "$(which avrdude)" avrdude/avrdude
-          avrdude/avrdude -v 2>&1 | head -2
+          sudo apt-get install -y avrdude xvfb
 
-      # ── Package – Windows ──────────────────────────────────
+      - name: Build executable
+        shell: bash
+        env:
+          APP_VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          export APP_VERSION="${APP_VERSION#v}"
+          pyinstaller --noconfirm openevse_flasher.spec
+
+      # ── Smoke tests ────────────────────────────────────────
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python scripts/smoke_test.py avrdude avrdude/avrdude.exe avrdude/avrdude.conf
+          python scripts/smoke_test.py app dist/OpenEVSE_Flasher.exe
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/OpenEVSE Flasher.app"
+          # Prove the bundled avrdude works without Homebrew's copy
+          brew uninstall --ignore-dependencies avrdude libusb libusb-compat hidapi libftdi libelf || true
+          AVRDUDE=$(find "$APP" -type f -name avrdude | head -1)
+          CONF=$(find "$APP" -name avrdude.conf | head -1)
+          python scripts/smoke_test.py avrdude "$AVRDUDE" "$CONF"
+          python scripts/smoke_test.py app "$APP/Contents/MacOS/OpenEVSE_Flasher"
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python scripts/smoke_test.py app dist/OpenEVSE_Flasher
+
+      # ── Package ────────────────────────────────────────────
       - name: Package (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release\avrdude | Out-Null
-          New-Item -ItemType Directory -Force -Path release\drivers | Out-Null
-          Copy-Item dist\OpenEVSE_Flasher.exe release\
-          if (Test-Path avrdude\avrdude.exe) { Copy-Item avrdude\avrdude.exe release\avrdude\ }
-          if (Test-Path avrdude\avrdude.conf) { Copy-Item avrdude\avrdude.conf release\avrdude\ }
-          if (Test-Path drivers\zadig.ini)    { Copy-Item drivers\zadig.ini    release\drivers\ }
-          if (Test-Path drivers\usbasp.cfg)   { Copy-Item drivers\usbasp.cfg   release\drivers\ }
-          if (Test-Path eeprom_24.bin)        { Copy-Item eeprom_24.bin        release\ }
-          if (Test-Path README.md)            { Copy-Item README.md            release\ }
-          Compress-Archive -Path release\* -DestinationPath ${{ matrix.zip }} -Force
+        shell: bash
+        run: cp dist/OpenEVSE_Flasher.exe "${{ matrix.asset }}"
 
-      # ── Package – macOS / Linux ────────────────────────────
-      - name: Package (macOS / Linux)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p release/avrdude release/drivers
-          cp ${{ matrix.exe }} release/OpenEVSE_Flasher
-          chmod +x release/OpenEVSE_Flasher
-          [ -f avrdude/avrdude    ] && cp avrdude/avrdude    release/avrdude/ && chmod +x release/avrdude/avrdude
-          [ -f drivers/zadig.ini  ] && cp drivers/zadig.ini  release/drivers/
-          [ -f drivers/usbasp.cfg ] && cp drivers/usbasp.cfg release/drivers/
-          [ -f eeprom_24.bin      ] && cp eeprom_24.bin      release/
-          [ -f README.md          ] && cp README.md          release/
-          cd release && zip -r ../${{ matrix.zip }} . && cd ..
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        # ditto keeps the bundle's symlinks and code signature intact
+        run: ditto -c -k --keepParent "dist/OpenEVSE Flasher.app" "${{ matrix.asset }}"
 
-      # ── Upload artifact (for release job) ──────────────────
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p pkg/OpenEVSE_Flasher
+          cp dist/OpenEVSE_Flasher pkg/OpenEVSE_Flasher/
+          chmod +x pkg/OpenEVSE_Flasher/OpenEVSE_Flasher
+          tar -czf "${{ matrix.asset }}" -C pkg OpenEVSE_Flasher
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.zip }}
-          path: ${{ matrix.zip }}
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
 
   # ──────────────────────────────────────────────────────────
-  # Publish all three zips to a single GitHub Release
+  # Attach all downloads to the GitHub Release
   # ──────────────────────────────────────────────────────────
   release:
     name: Publish Release
     needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.tag != '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -154,9 +158,13 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: '*.zip'
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            *.exe
+            *.zip
+            *.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true

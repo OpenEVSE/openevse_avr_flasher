@@ -3,7 +3,8 @@
 OpenEVSE AVR Firmware Flasher
 Downloads and flashes OpenEVSE controller firmware via USBasp.
 Programmer=usbasp, MCU=atmega328p. No serial port needed.
-avrdude must be placed in an 'avrdude/' sub-folder next to this script.
+avrdude is looked for in an 'avrdude/' sub-folder next to this script (or
+inside the standalone executable), then on the system PATH.
 Firmware fetched from: https://github.com/OpenEVSE/open_evse/releases
 """
 
@@ -57,27 +58,85 @@ ORANGE  = "#E65100"
 # Helpers
 # ---------------------------------------------------------------------------
 
+FROZEN = getattr(sys, "frozen", False)
+
+# Stop avrdude / PowerShell flashing a console window from the GUI on Windows
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 def script_dir():
-    return os.path.dirname(os.path.abspath(__file__))
+    """Folder the user sees: next to the .py, .exe, or macOS .app bundle."""
+    if not FROZEN:
+        return os.path.dirname(os.path.abspath(__file__))
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    if platform.system() == "Darwin" and exe_dir.endswith(".app/Contents/MacOS"):
+        return os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+    return exe_dir
 
-def find_avrdude():
-    exe     = "avrdude.exe" if platform.system() == "Windows" else "avrdude"
-    bundled = os.path.join(script_dir(), "avrdude", exe)
-    if os.path.isfile(bundled):
-        return bundled
-    import shutil
-    return shutil.which("avrdude")
+def bundle_dir():
+    """Files packed inside the standalone executable (PyInstaller)."""
+    return getattr(sys, "_MEIPASS", script_dir())
 
-def find_zadig():
-    for name in (ZADIG_FILENAME, "zadig.exe"):
-        p = os.path.join(script_dir(), "drivers", name)
+def search_dirs():
+    # Files placed next to the app override the ones packed inside it
+    return [script_dir()] + ([bundle_dir()] if FROZEN else [])
+
+def find_file(*parts):
+    for d in search_dirs():
+        p = os.path.join(d, *parts)
         if os.path.isfile(p):
             return p
     return None
 
+def writable_dir(name):
+    """A folder we can write to: next to the app if possible, else temp."""
+    for base in (script_dir(), tempfile.gettempdir()):
+        d = os.path.join(base, name)
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            pass
+    return tempfile.mkdtemp()
+
+def find_avrdude():
+    exe     = "avrdude.exe" if platform.system() == "Windows" else "avrdude"
+    bundled = find_file("avrdude", exe)
+    if bundled:
+        return bundled
+    import shutil
+    return shutil.which("avrdude")
+
+def avrdude_cmd(avrdude, *args):
+    """avrdude command line, using the avrdude.conf shipped alongside it."""
+    cmd  = [avrdude]
+    conf = os.path.join(os.path.dirname(avrdude), "avrdude.conf")
+    if os.path.isfile(conf):
+        cmd += ["-C", conf]
+    return cmd + list(args)
+
+def system_env():
+    """Environment for launching system tools (pkexec, xdg-open, ...).
+    A frozen Linux build points LD_LIBRARY_PATH at its own libraries; undo
+    that so system programs load the system's copies."""
+    env = dict(os.environ)
+    if FROZEN and platform.system() == "Linux":
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+def find_zadig():
+    for name in (ZADIG_FILENAME, "zadig.exe"):
+        p = find_file("drivers", name)
+        if p:
+            return p
+    return None
+
 def find_eeprom():
-    p = os.path.join(script_dir(), EEPROM_FILENAME)
-    return p if os.path.isfile(p) else None
+    return find_file(EEPROM_FILENAME)
 
 def ensure_zadig_ini(drivers_dir):
     with open(os.path.join(drivers_dir, "zadig.ini"), "w") as f:
@@ -93,7 +152,7 @@ def check_usbasp_driver_windows():
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
         if r.returncode == 0:
             out = r.stdout.strip().lower()
             if not out:
@@ -123,7 +182,8 @@ def check_usbasp_driver_windows():
 
 def usbasp_on_bus_linux():
     try:
-        out = subprocess.check_output(["lsusb"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["lsusb"], text=True, stderr=subprocess.DEVNULL,
+                                      env=system_env())
         return (USBASP_VID + ":" + USBASP_PID) in out.lower()
     except Exception:
         return False
@@ -281,10 +341,9 @@ class OpenEVSEFlasher(tk.Tk):
             "  3. Click Install Driver\n\n"
             "The installer will close automatically when done.")
         def task():
-            drivers_dir = os.path.join(script_dir(), "drivers")
-            os.makedirs(drivers_dir, exist_ok=True)
             path = find_zadig()
             if not path:
+                drivers_dir = writable_dir("drivers")
                 self._log("Downloading driver installer...")
                 dest = os.path.join(drivers_dir, ZADIG_FILENAME)
                 try:
@@ -311,7 +370,10 @@ class OpenEVSEFlasher(tk.Tk):
                 except Exception as e:
                     self._log("Download failed: " + str(e))
                     return
-            ensure_zadig_ini(drivers_dir)
+            try:
+                ensure_zadig_ini(os.path.dirname(path))
+            except OSError:
+                pass
             self._log("Opening driver installer...")
             try:
                 os.startfile(path)
@@ -368,7 +430,7 @@ class OpenEVSEFlasher(tk.Tk):
                             "cp '%s' '%s' && chmod 644 '%s' && "
                             "udevadm control --reload-rules && udevadm trigger"
                             % (tmp, UDEV_RULE_PATH, UDEV_RULE_PATH)],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=system_env())
                     if r.returncode == 0:
                         ok = True
                         break
@@ -474,15 +536,19 @@ class OpenEVSEFlasher(tk.Tk):
         self._log("Checking avrdude...")
         path = find_avrdude()
         if path:
-            r   = subprocess.run([path, "-v"], capture_output=True, text=True)
+            r   = subprocess.run(avrdude_cmd(path, "-v"), capture_output=True,
+                                 text=True, creationflags=NO_WINDOW)
             ver = next((l.strip() for l in r.stderr.splitlines()
                         if "avrdude" in l.lower()), "")
-            self._log("Found: " + path)
+            if FROZEN and path.startswith(bundle_dir()):
+                self._log("Found: avrdude (built in)")
+            else:
+                self._log("Found: " + path)
             if ver:
                 self._log("  " + ver)
         else:
             self._log("avrdude not found.")
-            self._log("  Place it in the 'avrdude/' folder next to this script.")
+            self._log("  Place it in the 'avrdude/' folder next to this program.")
 
     def _fetch_releases(self):
         self._status("Fetching releases from GitHub...")
@@ -589,14 +655,15 @@ class OpenEVSEFlasher(tk.Tk):
             try:
                 fw  = self._resolve_firmware()
                 fmt = "i" if fw.lower().endswith(".hex") else "r"
-                cmd = [avrdude, "-p", MCU, "-c", PROGRAMMER,
-                       "-Uflash:w:%s:%s" % (fw, fmt), "-v"]
+                cmd = avrdude_cmd(avrdude, "-p", MCU, "-c", PROGRAMMER,
+                                  "-Uflash:w:%s:%s" % (fw, fmt), "-v")
                 self._log("--- Flashing firmware ---")
                 self._run_cmd(cmd)
                 self._log("Firmware flashed OK.")
 
                 if self.do_fuses.get():
-                    fuse_cmd = [avrdude, "-p", MCU, "-c", PROGRAMMER] + FUSE_ARGS + ["-v"]
+                    fuse_cmd = avrdude_cmd(avrdude, "-p", MCU, "-c", PROGRAMMER,
+                                           *FUSE_ARGS, "-v")
                     self._log("--- Burning fuse bits ---")
                     self._run_cmd(fuse_cmd)
                     self._log("Fuses written OK.")
@@ -605,10 +672,10 @@ class OpenEVSEFlasher(tk.Tk):
                     eeprom = find_eeprom()
                     if not eeprom:
                         self._log("EEPROM file not found: " + EEPROM_FILENAME)
-                        self._log("  Place it next to openevse_flasher.py to enable.")
+                        self._log("  Place it next to this program to enable.")
                     else:
-                        eeprom_cmd = [avrdude, "-p", MCU, "-c", PROGRAMMER,
-                                      "-Ueeprom:w:%s:r" % eeprom, "-v"]
+                        eeprom_cmd = avrdude_cmd(avrdude, "-p", MCU, "-c", PROGRAMMER,
+                                                 "-Ueeprom:w:%s:r" % eeprom, "-v")
                         self._log("--- Writing EEPROM defaults ---")
                         self._run_cmd(eeprom_cmd)
                         self._log("EEPROM written OK.")
@@ -649,7 +716,8 @@ class OpenEVSEFlasher(tk.Tk):
 
     def _run_cmd(self, cmd):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                creationflags=NO_WINDOW)
         for line in proc.stdout:
             self._log(line.rstrip())
         proc.wait()
@@ -680,9 +748,9 @@ class OpenEVSEFlasher(tk.Tk):
         if platform.system() == "Windows":
             os.startfile(path)
         elif platform.system() == "Darwin":
-            subprocess.run(["open", path])
+            subprocess.run(["open", path], env=system_env())
         else:
-            subprocess.run(["xdg-open", path])
+            subprocess.run(["xdg-open", path], env=system_env())
 
 # ---------------------------------------------------------------------------
 # Entry point

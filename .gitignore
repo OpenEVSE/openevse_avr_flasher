@@ -1,0 +1,5 @@
+build/
+dist/
+pkg/
+__pycache__/
+OpenEVSE_Flasher-*
